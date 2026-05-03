@@ -13,6 +13,7 @@ Features:
 - Comprehensive JSON logging of all AdaEvolve signals
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -98,6 +99,17 @@ class AdaEvolveController(DiscoveryController):
         self._iteration_stats_file = None
         self._last_sampling_mode: Optional[str] = None
         self._last_sampling_intensity: Optional[float] = None
+
+        # Parallel-iteration coordination. Lazily-initialised because asyncio
+        # locks must be created on the running event loop.
+        self._scheduler_lock: Optional[asyncio.Lock] = None
+        self._paradigm_lock: Optional[asyncio.Lock] = None
+        # Tracks the highest contiguous iteration that has fully completed,
+        # used by the parallel loop to fire checkpoints in iteration order
+        # despite out-of-order task completion.
+        self._completed_iterations: set = set()
+        self._highest_contiguous_completed: int = -1
+        self._last_checkpoint_iteration: int = -1
 
         logger.info(
             f"AdaEvolveController initialized "
@@ -229,11 +241,19 @@ class AdaEvolveController(DiscoveryController):
         max_iterations: int,
         checkpoint_callback=None,
     ) -> Optional[Program]:
-        """Run evolution with adaptive search intensity and island rotation."""
+        """Run evolution with adaptive search intensity and island rotation.
+
+        Sequential by default. When ``config.max_parallel_iterations > 1``
+        delegates to ``_run_discovery_parallel`` which runs up to N
+        iterations concurrently with distinct-island reservations.
+        """
         total = start_iteration + max_iterations
+        max_parallel = max(1, getattr(self.config, "max_parallel_iterations", 1))
+
         logger.info(
             f"AdaEvolve: Running {max_iterations} iterations "
-            f"across {self.database.num_islands} islands"
+            f"across {self.database.num_islands} islands "
+            f"(max_parallel={max_parallel})"
         )
 
         # Set up comprehensive JSON logging for iteration stats
@@ -242,6 +262,31 @@ class AdaEvolveController(DiscoveryController):
         # Ensure all islands are seeded
         self._ensure_all_islands_seeded()
 
+        if max_parallel > 1:
+            await self._run_discovery_parallel(
+                start_iteration, total, max_parallel, checkpoint_callback,
+            )
+        else:
+            await self._run_discovery_sequential(
+                start_iteration, total, checkpoint_callback,
+            )
+
+        logger.info("AdaEvolve completed")
+        self.database.log_status()
+
+        # Log final summary and stats file location
+        if self._iteration_stats_log_path:
+            logger.info(f"AdaEvolve iteration stats saved to: {self._iteration_stats_log_path}")
+
+        return self.database.get_best_program()
+
+    async def _run_discovery_sequential(
+        self,
+        start_iteration: int,
+        total: int,
+        checkpoint_callback,
+    ) -> None:
+        """Original sequential discovery loop (max_parallel_iterations=1)."""
         for iteration in range(start_iteration, total):
             if self.shutdown_event.is_set():
                 logger.info("Shutdown requested")
@@ -256,49 +301,222 @@ class AdaEvolveController(DiscoveryController):
                 # This handles island rotation (UCB) and migration
                 self.database.end_iteration(iteration)
 
-        logger.info("AdaEvolve completed")
-        self.database.log_status()
+    async def _run_discovery_parallel(
+        self,
+        start_iteration: int,
+        total: int,
+        max_parallel: int,
+        checkpoint_callback,
+    ) -> None:
+        """Parallel discovery loop with distinct-island reservations.
 
-        # Log final summary and stats file location
-        if self._iteration_stats_log_path:
-            logger.info(f"AdaEvolve iteration stats saved to: {self._iteration_stats_log_path}")
+        Differences from sequential:
+        - Up to ``max_parallel`` iterations in flight at once.
+        - Each iteration reserves a distinct island via
+          ``database.reserve_island()`` under ``_scheduler_lock`` so
+          concurrent samples don't cluster on the same island.
+        - ``end_iteration()`` and ``release_island()`` run together under
+          the same lock so spawn/migrate are atomic w.r.t. concurrent
+          reserves.
+        - Checkpoints fire from this loop based on the highest contiguous
+          completed iteration (iterations finish out of order, but
+          checkpoints stay deterministic).
+        """
+        # Initialize asyncio locks now that we're on the event loop.
+        if self._scheduler_lock is None:
+            self._scheduler_lock = asyncio.Lock()
+        if self._paradigm_lock is None:
+            self._paradigm_lock = asyncio.Lock()
 
-        return self.database.get_best_program()
+        # Validate the constraint that makes distinct-island reservation
+        # always succeed. Dynamic spawning may grow num_islands later, but
+        # we need to start safe.
+        if max_parallel > self.database.num_islands:
+            raise ValueError(
+                f"max_parallel_iterations ({max_parallel}) > num_islands "
+                f"({self.database.num_islands}); each in-flight iteration "
+                f"needs a distinct island. Reduce MAX_PARALLEL_EVALS or "
+                f"increase num_islands."
+            )
+
+        # Reset checkpoint tracking for this run
+        self._completed_iterations = set()
+        self._highest_contiguous_completed = start_iteration - 1
+        self._last_checkpoint_iteration = start_iteration - 1
+
+        sem = asyncio.Semaphore(max_parallel)
+        pending: set = set()
+
+        logger.info(
+            f"AdaEvolve parallel: up to {max_parallel} iterations in flight "
+            f"({start_iteration}..{total - 1})"
+        )
+
+        async def _bounded_iteration(iteration: int) -> None:
+            """Run one iteration: reserve island, run, release+end_iteration."""
+            async with sem:
+                if self.shutdown_event.is_set():
+                    return
+
+                # Reserve a distinct island (sync, but lock-protected for
+                # composition with end_iteration and future-proofing).
+                async with self._scheduler_lock:
+                    try:
+                        island = self.database.reserve_island()
+                    except RuntimeError as e:
+                        logger.error(f"Iteration {iteration}: {e}")
+                        return
+
+                try:
+                    # checkpoint_callback=None — parallel loop fires
+                    # checkpoints based on highest-contiguous-completed,
+                    # not per-iteration.
+                    await self._run_iteration(
+                        iteration, checkpoint_callback=None, island_idx=island,
+                    )
+                except Exception as e:
+                    logger.exception(f"Iteration {iteration} failed: {e}")
+                finally:
+                    async with self._scheduler_lock:
+                        self.database.release_island(island)
+                        # CRITICAL: rotation/spawn/migration. Sync, runs
+                        # under the same lock so concurrent reserves can't
+                        # observe a half-spawned island.
+                        try:
+                            self.database.end_iteration(iteration)
+                        except Exception as e:
+                            logger.exception(
+                                f"end_iteration({iteration}) failed: {e}"
+                            )
+
+                    # Advance the contiguous-completed pointer and fire any
+                    # pending checkpoints in iteration order.
+                    self._mark_iteration_complete(iteration, checkpoint_callback)
+
+        # Backpressure: keep the pipeline full but bounded
+        for iteration in range(start_iteration, total):
+            if self.shutdown_event.is_set():
+                break
+
+            task = asyncio.create_task(
+                _bounded_iteration(iteration), name=f"iter_{iteration}",
+            )
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+            if len(pending) >= max_parallel:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in done:
+                    if t.exception() is not None:
+                        logger.warning(
+                            f"Parallel iteration task failed: {t.exception()}"
+                        )
+
+        # Drain remaining tasks
+        if pending:
+            done, _ = await asyncio.wait(pending)
+            for t in done:
+                if t.exception() is not None:
+                    logger.warning(
+                        f"Parallel drain: task failed: {t.exception()}"
+                    )
+
+    def _mark_iteration_complete(self, iteration: int, checkpoint_callback) -> None:
+        """Track completion and fire checkpoints in iteration order.
+
+        Called from each parallel task after end_iteration. Iterations
+        complete out of order, but we want checkpoints to fire
+        deterministically. So we maintain a contiguous high-water mark and
+        only fire callbacks when the mark advances past a checkpoint
+        interval boundary.
+
+        Sync method — atomic between awaits in asyncio.
+        """
+        self._completed_iterations.add(iteration)
+
+        # Advance the contiguous pointer as far as completed_iterations
+        # allows.
+        next_iter = self._highest_contiguous_completed + 1
+        while next_iter in self._completed_iterations:
+            self._completed_iterations.discard(next_iter)
+            self._highest_contiguous_completed = next_iter
+            next_iter += 1
+
+        if checkpoint_callback is None:
+            return
+
+        interval = self.config.checkpoint_interval
+        high = self._highest_contiguous_completed
+        # Find the largest interval-aligned iteration we've now passed
+        # but haven't checkpointed yet.
+        target = (high // interval) * interval
+        if target > 0 and target > self._last_checkpoint_iteration:
+            self._last_checkpoint_iteration = target
+            logger.info(
+                f"Checkpoint interval reached at iteration {target} "
+                f"(contiguous up to {high})"
+            )
+            self.database.log_status()
+            try:
+                checkpoint_callback(target)
+            except Exception as e:
+                logger.exception(f"Checkpoint callback failed: {e}")
 
     def _ensure_all_islands_seeded(self) -> None:
-        """Ensure all islands have at least one program."""
-        # Find a seed program
-        seed_program = None
+        """Ensure all islands have at least one program.
+
+        Empty islands receive clones from the available seed pool, distributed
+        round-robin so that seed diversity is preserved when num_islands >
+        num_seeds. With 2 seeds across 48 islands this yields ~24 clones per
+        seed instead of 47 from one and 1 from the other.
+        """
+        # Collect one program from each already-populated island as the pool.
+        seed_pool: List[Program] = []
         for i in range(self.database.num_islands):
-            size = self.database.get_island_size(i)
-            if size > 0 and seed_program is None:
+            if self.database.get_island_size(i) > 0:
                 population = self.database.get_island_population(i)
                 if population:
-                    seed_program = population[0]
-                    break
+                    seed_pool.append(population[0])
 
-        if seed_program is None:
+        if not seed_pool:
             logger.warning("No seed program found")
             return
 
-        # Seed empty islands
+        rr_idx = 0
         for i in range(self.database.num_islands):
             if self.database.get_island_size(i) == 0:
+                seed = seed_pool[rr_idx % len(seed_pool)]
+                rr_idx += 1
                 copy = Program(
                     id=str(uuid.uuid4()),
-                    solution=seed_program.solution,
-                    language=seed_program.language,
-                    metrics=seed_program.metrics.copy() if seed_program.metrics else {},
-                    iteration_found=seed_program.iteration_found,
+                    solution=seed.solution,
+                    language=seed.language,
+                    metrics=seed.metrics.copy() if seed.metrics else {},
+                    iteration_found=seed.iteration_found,
                     parent_id=None,
                     generation=0,
-                    metadata={"seeded_to_island": i},
+                    metadata={"seeded_to_island": i, "cloned_from": seed.id},
                 )
                 self.database.add(copy, iteration=0, target_island=i)
-                logger.info(f"Seeded island {i}")
+                logger.info(f"Seeded island {i} (clone of {seed.id[:8]})")
 
-    async def _run_iteration(self, iteration: int, checkpoint_callback) -> None:
-        """Execute one evolution iteration."""
+    async def _run_iteration(
+        self,
+        iteration: int,
+        checkpoint_callback,
+        island_idx: Optional[int] = None,
+    ) -> SerializableResult:
+        """Execute one evolution iteration.
+
+        Args:
+            island_idx: Explicit island (parallel mode). None = sequential.
+
+        Returns:
+            The SerializableResult so the parallel caller can inspect it.
+            (Sequential callers can ignore the return value.)
+        """
         iteration_start_time = time.time()
 
         # Check for global paradigm stagnation
@@ -306,17 +524,25 @@ class AdaEvolveController(DiscoveryController):
         if self.database.use_paradigm_breakthrough and self.database.is_paradigm_stagnating():
             await self._generate_paradigms_if_needed()
 
-        result = await self._run_normal_step(iteration)
+        result = await self._run_normal_step(iteration, island_idx=island_idx)
 
         iteration_time = time.time() - iteration_start_time
+
+        # Prefer per-result sampling state (set by _generate_child) over
+        # shared self.* fields so parallel iterations log accurate values.
+        sampling_mode = result.sampling_mode if result.sampling_mode is not None else self._last_sampling_mode
+        sampling_intensity = (
+            result.sampling_intensity if result.sampling_intensity is not None
+            else self._last_sampling_intensity
+        )
 
         if result.error:
             logger.warning(f"Iteration {iteration}: {result.error}")
             # Log failed iteration stats
             self._log_iteration_stats(
                 iteration=iteration,
-                sampling_mode=self._last_sampling_mode,
-                sampling_intensity=self._last_sampling_intensity,
+                sampling_mode=sampling_mode,
+                sampling_intensity=sampling_intensity,
                 child_program=None,
                 iteration_time=iteration_time,
                 llm_generation_time=result.llm_generation_time,
@@ -328,23 +554,41 @@ class AdaEvolveController(DiscoveryController):
             # Log successful iteration stats
             self._log_iteration_stats(
                 iteration=iteration,
-                sampling_mode=self._last_sampling_mode,
-                sampling_intensity=self._last_sampling_intensity,
+                sampling_mode=sampling_mode,
+                sampling_intensity=sampling_intensity,
                 child_program=result.child_program_dict,
                 iteration_time=result.iteration_time,
                 llm_generation_time=result.llm_generation_time,
                 eval_time=result.eval_time,
                 error=None,
             )
+        return result
 
     async def _generate_paradigms_if_needed(self) -> None:
-        """Generate new paradigms if stagnating and none active."""
+        """Generate new paradigms if stagnating and none active.
+
+        In parallel mode, multiple concurrent iterations can pass the
+        ``has_active_paradigm()`` check before any of them sets a paradigm,
+        which would spawn N redundant paradigm-LLM calls. ``_paradigm_lock``
+        serialises the check + generate sequence across the await.
+        """
         if self.paradigm_generator is None:
+            return
+
+        if self._paradigm_lock is not None:
+            async with self._paradigm_lock:
+                if self.database.has_active_paradigm():
+                    return  # Another iteration already generated paradigms
+                await self._do_generate_paradigms()
             return
 
         if self.database.has_active_paradigm():
             return  # Already have paradigms to use
 
+        await self._do_generate_paradigms()
+
+    async def _do_generate_paradigms(self) -> None:
+        """Inner implementation of paradigm generation (no locking)."""
         logger.info("Global paradigm stagnation detected, generating breakthrough ideas...")
 
         # Get current best program for context
@@ -376,13 +620,24 @@ class AdaEvolveController(DiscoveryController):
         else:
             logger.warning("Failed to generate paradigms")
 
-    async def _run_normal_step(self, iteration: int) -> SerializableResult:
-        """Run a normal iteration with optional retry."""
+    async def _run_normal_step(
+        self,
+        iteration: int,
+        island_idx: Optional[int] = None,
+    ) -> SerializableResult:
+        """Run a normal iteration with optional retry.
+
+        Args:
+            island_idx: Explicit island for parallel mode (forwarded to
+                ``_generate_child``). None preserves sequential behaviour.
+        """
         last_error = None
         attempts = 1 + (self.max_retries if self.enable_retry else 0)
 
         for attempt in range(attempts):
-            result = await self._generate_child(iteration, error_context=last_error)
+            result = await self._generate_child(
+                iteration, error_context=last_error, island_idx=island_idx,
+            )
             if not result.error:
                 return result
             last_error = result.error
@@ -452,12 +707,14 @@ class AdaEvolveController(DiscoveryController):
         elif self.database.best_program_id == child.id:
             logger.info(f"New best solution found at iteration {iteration}")
 
-        # Checkpoint callback
-        if iteration > 0 and iteration % self.config.checkpoint_interval == 0:
+        # Checkpoint callback. In parallel mode the caller passes None and
+        # checkpoints are fired from _mark_iteration_complete based on the
+        # highest contiguous completed iteration, so we skip in-line
+        # firing here to avoid duplicate / out-of-order checkpoints.
+        if checkpoint_callback is not None and iteration > 0 and iteration % self.config.checkpoint_interval == 0:
             logger.info(f"Checkpoint interval reached at iteration {iteration}")
             self.database.log_status()
-            if checkpoint_callback:
-                checkpoint_callback(iteration)
+            checkpoint_callback(iteration)
 
     # =========================================================================
     # Child Generation
@@ -468,8 +725,17 @@ class AdaEvolveController(DiscoveryController):
         iteration: int,
         error_context: Optional[str] = None,
         force_exploration: bool = False,
+        island_idx: Optional[int] = None,
     ) -> SerializableResult:
-        """Generate and evaluate a single child program."""
+        """Generate and evaluate a single child program.
+
+        Args:
+            island_idx: Explicit island to sample from. When None (sequential
+                mode) the database falls back to ``current_island``. Parallel
+                schedulers must pass an island reserved via
+                ``database.reserve_island()`` so concurrent in-flight
+                iterations land on distinct islands.
+        """
         try:
             if not self.database.programs:
                 return await self._run_from_scratch_iteration(iteration)
@@ -481,6 +747,7 @@ class AdaEvolveController(DiscoveryController):
             parent_dict, context_programs_dict = self.database.sample(
                 self.num_context_programs,
                 force_exploration=force_exploration,
+                island_idx=island_idx,
             )
 
             # Unpack parent dict (standard framework pattern)
@@ -492,18 +759,21 @@ class AdaEvolveController(DiscoveryController):
             parent_label = list(parent_dict.keys())[0]
             parent = list(parent_dict.values())[0]
 
-            # Read sampling mode stashed by database.sample()
+            # Capture per-iteration sampling state immediately (sync, no
+            # await) so parallel iterations don't overwrite each other's
+            # values via shared controller/database fields.
             sampling_mode = getattr(self.database, "_last_sampling_mode", None) or "balanced"
-
-            # Capture sampling mode and intensity for logging
-            self._last_sampling_mode = sampling_mode
-            current_island = self.database.current_island
+            effective_island = island_idx if island_idx is not None else self.database.current_island
             if self.database.use_adaptive_search:
-                self._last_sampling_intensity = self.database.adapter.get_search_intensity(
-                    current_island
-                )
+                sampling_intensity = self.database.adapter.get_search_intensity(effective_island)
             else:
-                self._last_sampling_intensity = self.database.fixed_intensity
+                sampling_intensity = self.database.fixed_intensity
+
+            # Sequential-mode compatibility: still stash on self for any
+            # legacy reader. In parallel mode the values on the
+            # SerializableResult are authoritative.
+            self._last_sampling_mode = sampling_mode
+            self._last_sampling_intensity = sampling_intensity
 
             # When paradigm is active, use best program as parent
             # This ensures paradigm (designed from best) is applied to best, not random parent
@@ -568,7 +838,7 @@ class AdaEvolveController(DiscoveryController):
                     self.feedback_reader.log_usage(iteration, feedback, self.feedback_reader.mode)
 
             # Generate and evaluate
-            return await self._execute_generation(
+            result = await self._execute_generation(
                 parent,
                 prompt,
                 iteration,
@@ -577,6 +847,13 @@ class AdaEvolveController(DiscoveryController):
                 context_program_ids=context_program_ids,
                 other_context_programs=context_programs_dict,
             )
+            # Attach per-iteration scheduling state to the result so
+            # parallel iterations can be logged correctly without sharing
+            # mutable controller/database fields.
+            result.sampling_mode = sampling_mode
+            result.sampling_intensity = sampling_intensity
+            result.island_idx = effective_island
+            return result
 
         except Exception as e:
             logger.exception(f"Generation failed: {e}")

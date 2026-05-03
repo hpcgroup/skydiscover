@@ -71,6 +71,11 @@ class SerializableResult:
     iteration: int = 0
     error: Optional[str] = None
     attempts_used: int = 1
+    # AdaEvolve-specific. Captured per-iteration so parallel runs don't race
+    # on shared controller state.
+    sampling_mode: Optional[str] = None
+    sampling_intensity: Optional[float] = None
+    island_idx: Optional[int] = None
 
 
 def load_database_from_file(

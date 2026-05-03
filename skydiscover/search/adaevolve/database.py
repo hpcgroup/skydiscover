@@ -12,9 +12,11 @@ A clean implementation that embodies adaptive optimization principles:
 
 import json
 import logging
+import math
 import os
 import random
 import uuid
+from collections import Counter
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from skydiscover.config import DatabaseConfig
@@ -270,6 +272,13 @@ class AdaEvolveDatabase(ProgramDatabase):
         # Last sampling mode (stashed by sample() for the controller to read)
         self._last_sampling_mode: Optional[str] = None
 
+        # Parallel-iteration scheduling state (only used when the controller
+        # runs iterations concurrently). Tracks how many in-flight iterations
+        # each island currently has so reserve_island() can spread load —
+        # preferring the least-loaded island. Uses a Counter rather than a
+        # set so num_islands < max_parallel_evals is supported (oversubscription).
+        self._in_flight_island_counts: Counter[int] = Counter()
+
         logger.info(
             f"AdaEvolveDatabase initialized: "
             f"num_islands={self.num_islands}, "
@@ -497,6 +506,7 @@ class AdaEvolveDatabase(ProgramDatabase):
         self,
         num_context_programs: Optional[int] = 4,
         force_exploration: bool = False,
+        island_idx: Optional[int] = None,
         **kwargs,
     ) -> Tuple[Dict[str, Program], Dict[str, List[Program]]]:
         """
@@ -520,11 +530,17 @@ class AdaEvolveDatabase(ProgramDatabase):
         Args:
             num_context_programs: Number of context programs
             force_exploration: Force exploration mode
+            island_idx: Explicit island to sample from. When None (sequential
+                mode), falls back to ``self.current_island``. Parallel
+                schedulers should always pass an explicit island reserved via
+                ``reserve_island()`` so concurrent sample() calls don't
+                cluster on the same island.
 
         Returns:
             Tuple of (parent_dict, context_programs_dict)
         """
-        island_idx = self.current_island
+        if island_idx is None:
+            island_idx = self.current_island
 
         if self.use_unified_archive and self.archives:
             return self._sample_from_archive(island_idx, num_context_programs, force_exploration)
@@ -793,6 +809,95 @@ class AdaEvolveDatabase(ProgramDatabase):
         if self.use_migration and iteration > 0 and iteration % self.migration_interval == 0:
             self._migrate()
             logger.info(f"Migration completed at iteration {iteration}")
+
+    # ------------------------------------------------------------------
+    # Parallel-iteration scheduling
+    #
+    # These two methods are sync but designed to be called by a controller
+    # that holds an asyncio.Lock around them. The body has no `await`, so
+    # the set mutation + UCB scan are atomic between event-loop yield points
+    # by construction; the controller-side lock is for defensive composition
+    # with end_iteration (spawn/migrate) and to guard against a future
+    # contributor introducing an await inside reserve_island.
+    # ------------------------------------------------------------------
+
+    def reserve_island(self) -> int:
+        """
+        Reserve an island for one in-flight iteration.
+
+        Picks among the least-loaded islands (those with the fewest current
+        in-flight reservations) so concurrent iterations spread evenly.
+        Within that least-loaded subset, the existing UCB / round-robin
+        selection rules apply. Always succeeds — when num_islands <
+        max_parallel_iterations, multiple iterations stack on the same
+        island (oversubscription).
+
+        The caller MUST hold ``AdaEvolveController._scheduler_lock`` while
+        calling this method, and must call ``release_island()`` exactly
+        once when the iteration finishes.
+        """
+        counts = self._in_flight_island_counts
+
+        if self.use_ucb_selection:
+            n = len(self.adapter.states)
+            min_load = min(counts.get(i, 0) for i in range(n))
+            eligible = [i for i in range(n) if counts.get(i, 0) == min_load]
+
+            # Underexplored-first within the least-loaded subset.
+            underexplored = [
+                i for i in eligible
+                if self.adapter.dimension_visits[i] < self.adapter.min_visits
+            ]
+            if underexplored:
+                chosen = random.choice(underexplored)
+                counts[chosen] += 1
+                return chosen
+
+            iteration = self._iteration_count
+            best_dim = -1
+            best_ucb = float("-inf")
+            for i in eligible:
+                raw_visits = self.adapter.dimension_visits[i]
+                dec_visits = self.adapter.decayed_visits[i]
+                reward_avg = (
+                    self.adapter.dimension_rewards[i] / dec_visits
+                    if dec_visits > 0 else 0.0
+                )
+                if raw_visits <= 0:
+                    exploration_bonus = float("inf")
+                else:
+                    exploration_bonus = self.adapter.ucb_exploration * math.sqrt(
+                        math.log(iteration + 1) / raw_visits
+                    )
+                score = reward_avg + exploration_bonus
+                if score > best_ucb:
+                    best_ucb = score
+                    best_dim = i
+
+            chosen = best_dim if best_dim >= 0 else eligible[0]
+            counts[chosen] += 1
+            return chosen
+
+        # Round-robin (ablation): pick the next-by-index island among the
+        # least-loaded subset.
+        n = self.num_islands
+        min_load = min(counts.get(i, 0) for i in range(n))
+        for offset in range(n):
+            i = (self.current_island + offset) % n
+            if counts.get(i, 0) == min_load:
+                counts[i] += 1
+                self.current_island = (i + 1) % n
+                return i
+        # Unreachable: at least one island matches min_load by construction.
+        raise RuntimeError("reserve_island: no island matched min_load (logic bug)")
+
+    def release_island(self, island_idx: int) -> None:
+        """Release a reservation made by ``reserve_island()``."""
+        counts = self._in_flight_island_counts
+        if counts.get(island_idx, 0) > 0:
+            counts[island_idx] -= 1
+            if counts[island_idx] == 0:
+                del counts[island_idx]
 
     def _migrate(self) -> None:
         """
