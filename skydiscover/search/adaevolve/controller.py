@@ -328,17 +328,6 @@ class AdaEvolveController(DiscoveryController):
         if self._paradigm_lock is None:
             self._paradigm_lock = asyncio.Lock()
 
-        # Validate the constraint that makes distinct-island reservation
-        # always succeed. Dynamic spawning may grow num_islands later, but
-        # we need to start safe.
-        if max_parallel > self.database.num_islands:
-            raise ValueError(
-                f"max_parallel_iterations ({max_parallel}) > num_islands "
-                f"({self.database.num_islands}); each in-flight iteration "
-                f"needs a distinct island. Reduce MAX_PARALLEL_EVALS or "
-                f"increase num_islands."
-            )
-
         # Reset checkpoint tracking for this run
         self._completed_iterations = set()
         self._highest_contiguous_completed = start_iteration - 1
