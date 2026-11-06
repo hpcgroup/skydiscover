@@ -483,6 +483,7 @@ class AdaEvolveController(DiscoveryController):
                     solution=seed.solution,
                     language=seed.language,
                     metrics=seed.metrics.copy() if seed.metrics else {},
+                    artifacts=self.database.copy_artifacts(seed),
                     iteration_found=seed.iteration_found,
                     parent_id=None,
                     generation=0,

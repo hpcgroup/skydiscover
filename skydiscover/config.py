@@ -407,6 +407,9 @@ class AdaEvolveDatabaseConfig(DatabaseConfig):
     use_ucb_selection: bool = True
     use_migration: bool = True
     use_unified_archive: bool = True
+    # Copies (island seeds, migrants, spawned-island seeds) keep the source's evaluator artifacts,
+    # so children of a copy see the same feedback. False = the original (as-published) behavior.
+    copies_keep_artifacts: bool = True
     fixed_intensity: float = 0.4
     migration_interval: int = 15
     migration_count: int = 5

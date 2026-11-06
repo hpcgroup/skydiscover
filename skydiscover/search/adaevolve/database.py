@@ -196,6 +196,8 @@ class AdaEvolveDatabase(ProgramDatabase):
         self.use_adaptive_search = getattr(config, "use_adaptive_search", True)
         self.use_ucb_selection = getattr(config, "use_ucb_selection", True)
         self.use_migration = getattr(config, "use_migration", True)
+        # copies_keep_artifacts: When False, program copies drop evaluator artifacts (original behavior)
+        self.copies_keep_artifacts = getattr(config, "copies_keep_artifacts", True)
         self.fixed_intensity = getattr(config, "fixed_intensity", 0.4)
 
         # Validate intensity bounds
@@ -380,6 +382,12 @@ class AdaEvolveDatabase(ProgramDatabase):
             return EXPLORE_LABEL_PROMPT_OPT, EXPLOIT_LABEL_PROMPT_OPT
         return EXPLORE_LABEL, EXPLOIT_LABEL
 
+    def copy_artifacts(self, program: Program) -> Dict[str, Any]:
+        """Artifacts for a copy of `program`: same solution, same evaluator feedback (unless ablated)."""
+        if not self.copies_keep_artifacts:
+            return {}
+        return dict(program.artifacts or {})
+
     def seed_all_islands(self, program: Program, iteration: Optional[int] = None) -> None:
         """
         Seed all islands with copies of the initial program.
@@ -401,6 +409,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                     solution=program.solution,
                     language=program.language,
                     metrics=program.metrics.copy() if program.metrics else {},
+                    artifacts=self.copy_artifacts(program),
                     iteration_found=iteration or 0,
                     parent_id=None,
                     generation=0,
@@ -932,6 +941,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                     solution=program.solution,
                     language=program.language,
                     metrics=program.metrics.copy() if program.metrics else {},
+                    artifacts=self.copy_artifacts(program),
                     iteration_found=program.iteration_found,
                     parent_id=program.id,
                     generation=program.generation,
@@ -966,6 +976,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                 solution=program.solution,
                 language=program.language,
                 metrics=program.metrics.copy() if program.metrics else {},
+                artifacts=self.copy_artifacts(program),
                 iteration_found=program.iteration_found,
                 parent_id=program.id,
                 generation=program.generation,
@@ -1281,6 +1292,7 @@ class AdaEvolveDatabase(ProgramDatabase):
             "migration_interval": self.migration_interval,
             "migration_count": self.migration_count,
             "use_migration": self.use_migration,
+            "copies_keep_artifacts": self.copies_keep_artifacts,
             "use_unified_archive": self.use_unified_archive,
             "local_context_program_ratio": self.local_context_program_ratio,
         }
@@ -2249,6 +2261,7 @@ class AdaEvolveDatabase(ProgramDatabase):
                 solution=program.solution,
                 language=program.language,
                 metrics=program.metrics.copy() if program.metrics else {},
+                artifacts=self.copy_artifacts(program),
                 iteration_found=self._iteration_count,
                 parent_id=program.id,
                 generation=program.generation,

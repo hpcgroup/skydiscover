@@ -94,6 +94,7 @@ search:
 ```
 
 Ablation flags: `use_adaptive_search`, `use_ucb_selection`, `use_migration`, `use_unified_archive`, `use_paradigm_breakthrough`, `use_dynamic_islands` — set any to `false` to disable.
+`copies_keep_artifacts` (default `true`): island seeds, migrants and spawned-island seeds keep the source program's evaluator artifacts, so their children get the same feedback. `false` restores the original behavior (copies carry metrics only).
 
 ### Multiobjective Mode
 

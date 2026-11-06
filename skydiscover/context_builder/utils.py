@@ -45,13 +45,17 @@ def prog_attr(program: Any, key: str, default: Any = "") -> Any:
 
 
 def format_artifacts(program: Any, heading: str = "##", max_len: int = 2000) -> str:
-    """Format evaluator artifacts (e.g. feedback) into markdown sections."""
+    """Format evaluator artifacts (e.g. feedback) into markdown sections.
+
+    Keys starting with "_" are evaluator bookkeeping (version stamps, dispatch
+    stats): they stay in the program/checkpoint but are not shown to the LLM.
+    """
     artifacts = prog_attr(program, "artifacts", None)
     if not artifacts:
         return ""
     sections = []
     for key, value in artifacts.items():
-        if value is None:
+        if value is None or str(key).startswith("_"):
             continue
         text = str(value)
         if len(text) > max_len:
